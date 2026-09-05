@@ -1,0 +1,89 @@
+# =============================================================================
+# JAL-ANOMALY  |  pilot deployment
+#
+# The prototype does not need any of this - `./run.sh` starts the whole thing on
+# SQLite.  This file is the shape of the pilot deployment described on the
+# technical approach slide, kept in the repository so the two are never out of
+# step.  It targets NIC MeghRaj or a state data centre; the same manifests
+# convert to Kubernetes with kompose.
+#
+#   docker compose -f deploy/docker-compose.yml up -d
+# =============================================================================
+services:
+
+  # meter time series
+  timescale:
+    image: timescale/timescaledb-ha:pg16
+    environment:
+      POSTGRES_DB: jal
+      POSTGRES_USER: jal
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-changeme}
+    volumes:
+      - timescale:/home/postgres/pgdata
+      - ./sql/schema.sql:/docker-entrypoint-initdb.d/10-schema.sql:ro
+    ports: ["5432:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U jal"]
+      interval: 10s
+      retries: 10
+
+  # Cloud-Optimised GeoTIFFs: EOS-04, SMAP, Sentinel tiles
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_USER:-jal}
+      MINIO_ROOT_PASSWORD: ${MINIO_PASSWORD:-changeme123}
+    volumes: ["minio:/data"]
+    ports: ["9000:9000", "9001:9001"]
+
+  # meter ingestion bus (HES/MDM -> MQTT/REST -> Kafka topics)
+  redpanda:
+    image: redpandadata/redpanda:latest
+    command: >
+      redpanda start --overprovisioned --smp 1 --memory 1G
+      --kafka-addr PLAINTEXT://0.0.0.0:9092 --advertise-kafka-addr PLAINTEXT://redpanda:9092
+    ports: ["9092:9092"]
+
+  # Celery broker and result backend
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+
+  # role-based access for the console and the API
+  keycloak:
+    image: quay.io/keycloak/keycloak:25.0
+    command: start-dev
+    environment:
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_PASSWORD:-changeme}
+    ports: ["8080:8080"]
+
+  api:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    environment:
+      JAL_DB_URL: postgresql://jal:${DB_PASSWORD:-changeme}@timescale:5432/jal
+      JAL_S3_ENDPOINT: http://minio:9000
+      JAL_KAFKA: redpanda:9092
+      JAL_OIDC_ISSUER: http://keycloak:8080/realms/jal
+    depends_on:
+      timescale: {condition: service_healthy}
+    ports: ["8000:8000"]
+    command: uvicorn app:api --host 0.0.0.0 --port 8000
+
+  # nightly scoring run
+  worker:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    environment:
+      JAL_DB_URL: postgresql://jal:${DB_PASSWORD:-changeme}@timescale:5432/jal
+      CELERY_BROKER: redis://redis:6379/0
+    depends_on: [timescale, redis]
+    command: celery -A pipeline.tasks worker -B --loglevel=info
+
+volumes:
+  timescale:
+  minio:
